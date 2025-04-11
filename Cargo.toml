@@ -27,5 +27,9 @@ rpds = "1.1.0"
 git = "https://github.com/egraphs-good/egraph-serialize"
 rev = "951b829a434f4008c7b45ba4ac0da1037d2da90"
 
+[[bin]]
+name = "extract_result"
+path = "src/extract_result.rs"
+
 [profile.release]
 debug = true
