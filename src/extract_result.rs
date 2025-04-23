@@ -45,17 +45,39 @@ fn main() {
     // Print the extraction result
     println!("Extraction Result:");
     println!("-----------------");
-    for (class_id, node_id) in &result.choices {
+    
+    // First, build a map from class_id to node_id for easy lookup
+    let mut class_to_node: std::collections::HashMap<ClassId, NodeId> = result.choices.clone().into_iter().collect();
+    
+    // Function to recursively print the expression
+    fn print_expr(egraph: &EGraph, class_to_node: &std::collections::HashMap<ClassId, NodeId>, class_id: &ClassId, indent: usize) -> String {
+        let node_id = match class_to_node.get(class_id) {
+            Some(id) => id,
+            None => return format!("UnknownClass({})", class_id),
+        };
+        
         let node = &egraph[node_id];
-        println!("Class {} -> Node {} (op: {}, cost: {})", 
-            class_id, 
-            node_id,
-            node.op,
-            node.cost
-        );
-        if !node.children.is_empty() {
-            println!("  Children: {:?}", node.children);
+        
+        if node.children.is_empty() {
+            // Leaf node
+            format!("{}", node.op)
+        } else {
+            // Internal node
+            let mut result = format!("({}", node.op);
+            for child in &node.children {
+                // Get the class ID from the egraph using the child node ID
+                let child_class = egraph.nid_to_cid(child);
+                result.push_str(&format!(" {}", print_expr(egraph, class_to_node, child_class, indent + 2)));
+            }
+            result.push(')');
+            result
         }
+    }
+    
+    // Print the S-expression for each root eclass
+    for root_class in &egraph.root_eclasses {
+        println!("Root expression:");
+        println!("{}", print_expr(&egraph, &class_to_node, root_class, 0));
     }
 
     // Print costs
