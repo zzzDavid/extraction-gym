@@ -43,8 +43,8 @@ fn main() {
     result.check(&egraph);
 
     // Print the extraction result
-    println!("Extraction Result:");
-    println!("-----------------");
+    // println!("Extraction Result:");
+    // println!("-----------------");
     
     // Build a map from class_id to node_id for easy lookup
     let class_to_node: std::collections::HashMap<ClassId, NodeId> = result.choices.clone().into_iter().collect();
@@ -178,14 +178,14 @@ fn main() {
     
     // Print assignments for each root eclass
     for root_class in &egraph.root_eclasses {
-        println!("Root expression assignments:");
+        // println!("Root expression assignments:");
         let result_var = print_assignments(&egraph, &class_to_node, root_class, &mut expr_vars);
-        println!("output = {}", result_var);
+        // println!("output = {}", result_var);
     }
 
     // Print costs
     let tree = result.tree_cost(&egraph, &egraph.root_eclasses);
     let dag = result.dag_cost(&egraph, &egraph.root_eclasses);
-    println!("\nTree cost: {}", tree);
-    println!("DAG cost: {}", dag);
+    // println!("\nTree cost: {}", tree);
+    // println!("DAG cost: {}", dag);
 }
