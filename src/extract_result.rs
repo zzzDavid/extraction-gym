@@ -111,6 +111,26 @@ fn main() {
                     let joined = child_vars.join(" + ");
                     println!("{} = {}", var_name, joined);
                 }
+            } else if node.op.starts_with("Not") {
+                if child_vars.len() == 1 {
+                    println!("{} = ~{}", var_name, child_vars[0]);
+                } else {
+                    println!("{} = ~({})", var_name, child_vars.join(", "));
+                }
+            } else if node.op.starts_with("Or") {
+                if child_vars.len() == 2 {
+                    println!("{} = {} | {}", var_name, child_vars[0], child_vars[1]);
+                } else {
+                    let joined = child_vars.join(" | ");
+                    println!("{} = {}", var_name, joined);
+                }
+            } else if node.op.starts_with("And") {
+                if child_vars.len() == 2 {
+                    println!("{} = {} & {}", var_name, child_vars[0], child_vars[1]);
+                } else {
+                    let joined = child_vars.join(" & ");
+                    println!("{} = {}", var_name, joined);
+                }
             } else if node.op.starts_with("Mul") {
                 // Check for Mul operation with a number constant
                 if node.op.contains("Num(") {
@@ -149,6 +169,22 @@ fn main() {
                         }
                     } else {
                         println!("{} = {} << 1", var_name, child_vars[0]);
+                    }
+                }
+            } else if node.op.starts_with("Shr") {
+                if child_vars.len() == 2 {
+                    println!("{} = {} >> {}", var_name, child_vars[0], child_vars[1]);
+                } else {
+                    // Extract the shift amount
+                    if let Some(amount_start) = node.op.find(',') {
+                        if let Some(end) = node.op[amount_start..].find(")") {
+                            let amount = node.op[amount_start+1..amount_start+end].trim();
+                            println!("{} = {} >> {}", var_name, child_vars[0], amount);
+                        } else {
+                            println!("{} = {} >> 1", var_name, child_vars[0]);
+                        }
+                    } else {
+                        println!("{} = {} >> 1", var_name, child_vars[0]);
                     }
                 }
             } else if node.op.starts_with("RootNode") {
