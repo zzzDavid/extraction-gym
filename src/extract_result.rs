@@ -187,6 +187,23 @@ fn main() {
                         println!("{} = {} >> 1", var_name, child_vars[0]);
                     }
                 }
+            } else if node.op.starts_with("MUXAR") {
+                if child_vars.len() == 3 {
+                    let b = &child_vars[0]; // The bit vector
+                    let a = &child_vars[1]; // First value
+                    let c = &child_vars[2]; // Second value
+                    
+                    // Create the expression: (b[0] ? a : c) << 0 + (b[1] ? a : c) << 1 + ... + (b[7] ? a : c) << 7
+                    let mut parts = Vec::new();
+                    for i in 0..8 {
+                        parts.push(format!("({}[{}] ? {} : {}) << {}", b, i, a, c, i));
+                    }
+                    
+                    println!("{} = {}", var_name, parts.join(" + "));
+                } else {
+                    // Fallback for unexpected number of arguments
+                    println!("{} = MUXAR({})", var_name, child_vars.join(", "));
+                }
             } else if node.op.starts_with("RootNode") {
                 if let Some(output_name_start) = node.op.find('"') {
                     if let Some(output_name_end) = node.op[output_name_start+1..].find('"') {
