@@ -5,9 +5,23 @@ use egraph_serialize::*;
 use ordered_float::NotNan;
 use anyhow::Context;
 use env_logger;
+use std::sync::mpsc;
+use std::time::Duration;
 
 pub type Cost = NotNan<f64>;
 pub const INFINITY: Cost = unsafe { NotNan::new_unchecked(std::f64::INFINITY) };
+
+fn run_extraction(egraph: &EGraph, extractor_name: &str) -> ExtractionResult {
+    let extractor: Box<dyn Extractor> = match extractor_name {
+        "faster-greedy-dag" => extract::faster_greedy_dag::FasterGreedyDagExtractor.boxed(),
+        "faster-bottom-up" => extract::faster_bottom_up::FasterBottomUpExtractor.boxed(),
+        "bottom-up" => extract::bottom_up::BottomUpExtractor.boxed(),
+        #[cfg(feature = "ilp-cbc")]
+        "ilp-cbc-timeout" => extract::ilp_cbc::CbcExtractorWithTimeout::<10>.boxed(),
+        _ => panic!("Unknown extractor: {}", extractor_name),
+    };
+    extractor.extract(egraph, &egraph.root_eclasses)
+}
 
 fn main() {
     env_logger::init();
@@ -18,6 +32,11 @@ fn main() {
         .opt_value_from_str("--extractor")
         .unwrap()
         .unwrap_or_else(|| "faster-greedy-dag".into());
+
+    let timeout_secs: u64 = args
+        .opt_value_from_str("--timeout")
+        .unwrap()
+        .unwrap_or(0);
 
     let filename: String = args.free_from_str().unwrap();
 
@@ -30,40 +49,72 @@ fn main() {
         .with_context(|| format!("Failed to parse {filename}"))
         .unwrap();
 
-    let extractor = match extractor_name.as_str() {
-        "faster-greedy-dag" => extract::faster_greedy_dag::FasterGreedyDagExtractor.boxed(),
-        "faster-bottom-up" => extract::faster_bottom_up::FasterBottomUpExtractor.boxed(),
-        "bottom-up" => extract::bottom_up::BottomUpExtractor.boxed(),
-        #[cfg(feature = "ilp-cbc")]
-        "ilp-cbc-timeout" => extract::ilp_cbc::CbcExtractorWithTimeout::<10>.boxed(),
-        _ => panic!("Unknown extractor: {}", extractor_name),
+    let result = if timeout_secs > 0 {
+        let (tx, rx) = mpsc::channel();
+        let eg = egraph.clone();
+        let ext_name = extractor_name.clone();
+        std::thread::spawn(move || {
+            let r = run_extraction(&eg, &ext_name);
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!(
+                    "Extraction with '{}' timed out after {}s, falling back to faster-bottom-up",
+                    extractor_name, timeout_secs
+                );
+                run_extraction(&egraph, "faster-bottom-up")
+            }
+        }
+    } else {
+        run_extraction(&egraph, &extractor_name)
     };
 
-    let result = extractor.extract(&egraph, &egraph.root_eclasses);
     result.check(&egraph);
 
-    // Print the extraction result
-    // println!("Extraction Result:");
-    // println!("-----------------");
-    
     // Build a map from class_id to node_id for easy lookup
     let class_to_node: std::collections::HashMap<ClassId, NodeId> = result.choices.clone().into_iter().collect();
     
-    // Map to store variable names for sub-expressions
-    let mut expr_vars = std::collections::HashMap::new();
-    
-    // Function to recursively print assignments for sub-expressions
-    fn print_assignments(
+    // Function to recursively build S-expression strings
+    fn is_nullary_function(op: &str) -> bool {
+        if op.is_empty() { return false; }
+        let first = op.as_bytes()[0];
+        if first.is_ascii_digit() { return false; }
+        if first == b'-' && op.len() > 1 && op.as_bytes()[1].is_ascii_digit() { return false; }
+        if first == b'"' { return false; }
+        true
+    }
+
+    fn count_refs(
         egraph: &EGraph,
         class_to_node: &std::collections::HashMap<ClassId, NodeId>,
         class_id: &ClassId,
-        expr_vars: &mut std::collections::HashMap<ClassId, String>,
-    ) -> String {
-        // Check if we've already processed this class
-        if let Some(var_name) = expr_vars.get(class_id) {
-            return var_name.clone();
+        ref_counts: &mut std::collections::HashMap<ClassId, usize>,
+    ) {
+        let count = ref_counts.entry(class_id.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 { return; }
+        if let Some(node_id) = class_to_node.get(class_id) {
+            for child in &egraph[node_id].children {
+                count_refs(egraph, class_to_node, egraph.nid_to_cid(child), ref_counts);
+            }
         }
-        
+    }
+
+    fn build_sexpr_dag(
+        egraph: &EGraph,
+        class_to_node: &std::collections::HashMap<ClassId, NodeId>,
+        class_id: &ClassId,
+        shared: &std::collections::HashSet<ClassId>,
+        aliases: &mut std::collections::HashMap<ClassId, String>,
+        defs: &mut Vec<String>,
+        alias_counter: &mut usize,
+    ) -> String {
+        if let Some(alias) = aliases.get(class_id) {
+            return alias.clone();
+        }
+
         let node_id = match class_to_node.get(class_id) {
             Some(id) => id,
             None => return format!("unknown_{}", class_id),
@@ -71,174 +122,85 @@ fn main() {
         
         let node = &egraph[node_id];
         
-        // Extract the node name to use as the variable name
-        let var_name = if node.children.is_empty() {
-            if node.op.starts_with("Var(") && node.op.ends_with(")") {
-                // Extract the variable name from Var("name")
-                let var_name_inner = &node.op[4..node.op.len()-1];
-                // Remove quotes if present
-                let var_name_clean = var_name_inner.trim_matches('"');
-                var_name_clean.to_string()
-            } else {
-                // Use node_id as a string for other leaf nodes
-                format!("{}", node_id)
-            }
-        } else {
-            // For non-leaf nodes, use node_id as name
-            format!("{}", node_id)
-        };
-        
-        // Process children and print assignments
         if node.children.is_empty() {
-            // Leaf node - no need to print assignment for variables
-            if !node.op.starts_with("Var(") {
-                println!("{} = {}", var_name, node.op);
-            }
-        } else {
-            // Process children first to ensure dependencies are handled
-            let mut child_vars = Vec::new();
-            for child in &node.children {
-                let child_class = egraph.nid_to_cid(child);
-                let child_var = print_assignments(egraph, class_to_node, child_class, expr_vars);
-                child_vars.push(child_var);
-            }
-            
-            // Format the assignment based on operation
-            if node.op.starts_with("Add") {
-                if child_vars.len() == 2 {
-                    println!("{} = {} + {}", var_name, child_vars[0], child_vars[1]);
-                } else {
-                    let joined = child_vars.join(" + ");
-                    println!("{} = {}", var_name, joined);
-                }
-            } else if node.op.starts_with("Not") {
-                if child_vars.len() == 1 {
-                    println!("{} = ~{}", var_name, child_vars[0]);
-                } else {
-                    println!("{} = ~({})", var_name, child_vars.join(", "));
-                }
-            } else if node.op.starts_with("Or") {
-                if child_vars.len() == 2 {
-                    println!("{} = {} | {}", var_name, child_vars[0], child_vars[1]);
-                } else {
-                    let joined = child_vars.join(" | ");
-                    println!("{} = {}", var_name, joined);
-                }
-            } else if node.op.starts_with("And") {
-                if child_vars.len() == 2 {
-                    println!("{} = {} & {}", var_name, child_vars[0], child_vars[1]);
-                } else {
-                    let joined = child_vars.join(" & ");
-                    println!("{} = {}", var_name, joined);
-                }
-            } else if node.op.starts_with("Mul") {
-                // Check for Mul operation with a number constant
-                if node.op.contains("Num(") {
-                    // Extract the number from the operation string
-                    if let Some(start) = node.op.find("Num(") {
-                        if let Some(end) = node.op[start..].find(")") {
-                            let num_str = &node.op[start+4..start+end];
-                            println!("{} = {} * {}", var_name, child_vars[0], num_str);
-                        } else {
-                            // Fallback if parsing fails
-                            let joined = child_vars.join(" * ");
-                            println!("{} = {}", var_name, joined);
-                        }
-                    } else {
-                        // Fallback if parsing fails
-                        let joined = child_vars.join(" * ");
-                        println!("{} = {}", var_name, joined);
-                    }
-                } else if child_vars.len() == 2 {
-                    println!("{} = {} * {}", var_name, child_vars[0], child_vars[1]);
-                } else {
-                    let joined = child_vars.join(" * ");
-                    println!("{} = {}", var_name, joined);
-                }
-            } else if node.op.starts_with("Shl") {
-                if child_vars.len() == 2 {
-                    println!("{} = {} << {}", var_name, child_vars[0], child_vars[1]);
-                } else {
-                    // Extract the shift amount
-                    if let Some(amount_start) = node.op.find(',') {
-                        if let Some(end) = node.op[amount_start..].find(")") {
-                            let amount = node.op[amount_start+1..amount_start+end].trim();
-                            println!("{} = {} << {}", var_name, child_vars[0], amount);
-                        } else {
-                            println!("{} = {} << 1", var_name, child_vars[0]);
-                        }
-                    } else {
-                        println!("{} = {} << 1", var_name, child_vars[0]);
-                    }
-                }
-            } else if node.op.starts_with("Shr") {
-                if child_vars.len() == 2 {
-                    println!("{} = {} >> {}", var_name, child_vars[0], child_vars[1]);
-                } else {
-                    // Extract the shift amount
-                    if let Some(amount_start) = node.op.find(',') {
-                        if let Some(end) = node.op[amount_start..].find(")") {
-                            let amount = node.op[amount_start+1..amount_start+end].trim();
-                            println!("{} = {} >> {}", var_name, child_vars[0], amount);
-                        } else {
-                            println!("{} = {} >> 1", var_name, child_vars[0]);
-                        }
-                    } else {
-                        println!("{} = {} >> 1", var_name, child_vars[0]);
-                    }
-                }
-            } else if node.op.starts_with("MUXAR") {
-                if child_vars.len() == 3 {
-                    let b = &child_vars[0]; // The bit vector
-                    let a = &child_vars[1]; // First value
-                    let c = &child_vars[2]; // Second value
-                    
-                    // Create the expression: (b[0] ? a : c) << 0 + (b[1] ? a : c) << 1 + ... + (b[7] ? a : c) << 7
-                    let mut parts = Vec::new();
-                    for i in 0..8 {
-                        parts.push(format!("({}[{}] ? {} : {}) << {}", b, i, a, c, i));
-                    }
-                    
-                    println!("{} = {}", var_name, parts.join(" + "));
-                } else {
-                    // Fallback for unexpected number of arguments
-                    println!("{} = MUXAR({})", var_name, child_vars.join(", "));
-                }
-            } else if node.op.starts_with("RootNode") {
-                if let Some(output_name_start) = node.op.find('"') {
-                    if let Some(output_name_end) = node.op[output_name_start+1..].find('"') {
-                        let output_name = &node.op[output_name_start+1..output_name_start+1+output_name_end];
-                        println!("{} = {}", output_name, child_vars[0]);
-                    } else {
-                        println!("{} = {}", var_name, child_vars[0]);
-                    }
-                } else {
-                    println!("{} = {}", var_name, child_vars[0]);
-                }
+            let result = if node.op.starts_with("Var(") && node.op.ends_with(")") {
+                let var_name_inner = &node.op[4..node.op.len()-1];
+                var_name_inner.trim_matches('"').to_string()
+            } else if is_nullary_function(&node.op) {
+                format!("({})", node.op)
             } else {
-                if child_vars.is_empty() {
-                    println!("{} = {}", var_name, node.op);
-                } else {
-                    println!("{} = {}({})", var_name, node.op, child_vars.join(", "));
-                }
+                node.op.clone()
+            };
+            if shared.contains(class_id) {
+                aliases.insert(class_id.clone(), result.clone());
             }
+            return result;
         }
         
-        // Store the variable name for this expression
-        expr_vars.insert(class_id.clone(), var_name.clone());
-        var_name
+        let mut child_exprs = Vec::new();
+        for child in &node.children {
+            let child_class = egraph.nid_to_cid(child);
+            let child_expr = build_sexpr_dag(egraph, class_to_node, child_class, shared, aliases, defs, alias_counter);
+            child_exprs.push(child_expr);
+        }
+        
+        let op_name = if let Some(paren_pos) = node.op.find('(') {
+            &node.op[..paren_pos]
+        } else {
+            &node.op
+        };
+        
+        let full_expr = format!("({} {})", op_name, child_exprs.join(" "));
+
+        if shared.contains(class_id) {
+            let alias = format!("__s{}", *alias_counter);
+            *alias_counter += 1;
+            defs.push(format!("(let {} {})", alias, full_expr));
+            aliases.insert(class_id.clone(), alias.clone());
+            return alias;
+        }
+
+        full_expr
     }
     
-    // Print assignments for each root eclass
+    // Count references to detect shared eclasses
+    let mut ref_counts: std::collections::HashMap<ClassId, usize> = std::collections::HashMap::new();
     for root_class in &egraph.root_eclasses {
-        // println!("Root expression assignments:");
-        let result_var = print_assignments(&egraph, &class_to_node, root_class, &mut expr_vars);
-        // println!("output = {}", result_var);
+        count_refs(&egraph, &class_to_node, root_class, &mut ref_counts);
     }
+    let shared: std::collections::HashSet<ClassId> = ref_counts.iter()
+        .filter(|(cid, &c)| {
+            if c <= 1 { return false; }
+            // Only alias Op-type eclasses (actual MLIR operations), not types/attrs/vecs
+            if let Some(nid) = class_to_node.get(*cid) {
+                let node = &egraph[nid];
+                !node.children.is_empty() && node.op.contains('_')
+            } else {
+                false
+            }
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
 
-    // Print costs
-    let tree = result.tree_cost(&egraph, &egraph.root_eclasses);
-    let dag = result.dag_cost(&egraph, &egraph.root_eclasses);
-    // println!("\nTree cost: {}", tree);
-    // println!("DAG cost: {}", dag);
+    let mut aliases = std::collections::HashMap::new();
+    let mut defs: Vec<String> = Vec::new();
+    let mut alias_counter: usize = 0;
+    for root_class in &egraph.root_eclasses {
+        let sexpr = build_sexpr_dag(&egraph, &class_to_node, root_class, &shared, &mut aliases, &mut defs, &mut alias_counter);
+        
+        // Skip the RootNode wrapper if present
+        let output = if sexpr.starts_with("(RootNode ") && sexpr.ends_with(")") {
+            &sexpr[10..sexpr.len()-1]
+        } else {
+            &sexpr
+        };
+
+        // Emit shared sub-expression definitions before the root expression
+        for def in &defs {
+            println!("{}", def);
+        }
+        defs.clear();
+
+        println!("{}", output);
+    }
 }
