@@ -36,7 +36,7 @@ fn main() {
     let timeout_secs: u64 = args
         .opt_value_from_str("--timeout")
         .unwrap()
-        .unwrap_or(0);
+        .unwrap_or(120);
 
     let filename: String = args.free_from_str().unwrap();
 
